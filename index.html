@@ -268,6 +268,7 @@ textarea{resize:vertical;min-height:54px}
       <h2 style="font-size:28px;text-transform:uppercase" id="waitTitle">Joining room…</h2>
       <div class="note" id="waitText">Connecting to the FDC.</div>
       <div class="bar" id="waitBar" hidden><i></i></div>
+      <button class="btn primary" id="retryBtn" hidden onclick="location.reload()">Retry</button>
     </div>
   </div>
   <div id="toast" hidden></div>
@@ -488,6 +489,17 @@ function addLog(box,who,text,cls){
    Lobby + networking
    ==================================================================== */
 const PEER_PREFIX='cff-trainer-v1-';
+const PEER_OPTS={debug:/debug/.test(location.search)?2:0,config:{iceServers:[
+  {urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']},
+  {urls:'stun:global.stun.twilio.com:3478'},
+  {urls:['turn:eu-0.turn.peerjs.com:3478','turn:us-0.turn.peerjs.com:3478'],username:'peerjs',credential:'peerjsp'}]}};
+const PEER_ERRORS={
+  'network':'Lost contact with the matchmaking server (0.peerjs.com). Check the internet connection.',
+  'server-error':'The matchmaking server (0.peerjs.com) is not responding. Try again in a minute.',
+  'socket-error':'The matchmaking server connection failed. A firewall or ad blocker may be blocking 0.peerjs.com.',
+  'socket-closed':'The matchmaking server closed the connection. Try again.',
+  'browser-incompatible':'This browser does not support WebRTC. Use a current Chrome, Edge or Firefox.',
+  'webrtc':'The browser could not open a WebRTC connection.'};
 const CODE_CHARS='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const newCode=()=>Array.from({length:6},()=>CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
 const App={name:'',role:null,peer:null};
@@ -519,15 +531,19 @@ function startFdc(){
   initFdcMap();
   const tryOpen=()=>{
     FDC.code=newCode();
-    const peer=App.peer=new Peer(PEER_PREFIX+FDC.code.toLowerCase(),{debug:0});
-    peer.on('open',()=>{$('#roomCode').textContent=FDC.code;$('#netState').textContent='online';location.hash=FDC.code;fdcLog('sys','Room open. Share the code with your observers.');});
+    const peer=App.peer=new Peer(PEER_PREFIX+FDC.code.toLowerCase(),PEER_OPTS);
+    const openTimer=setTimeout(()=>{if(!peer.open){$('#netState').textContent='offline';fdcLog('sys','Cannot reach the matchmaking server (0.peerjs.com). A firewall, VPN or ad blocker may be blocking it. Reload to retry.');}},12000);
+    peer.on('open',()=>{clearTimeout(openTimer);$('#roomCode').textContent=FDC.code;$('#netState').textContent='online';location.hash=FDC.code;fdcLog('sys','Room open. Share the code with your observers. Keep this tab open.');});
     peer.on('error',err=>{
-      if(err.type==='unavailable-id'){peer.destroy();tryOpen();return;}
-      $('#netState').textContent='error: '+err.type;
+      if(err.type==='unavailable-id'){clearTimeout(openTimer);peer.destroy();tryOpen();return;}
+      $('#netState').textContent='error';fdcLog('sys',PEER_ERRORS[err.type]||`Connection error: ${err.type}.`);
     });
-    peer.on('disconnected',()=>{$('#netState').textContent='reconnecting…';try{peer.reconnect();}catch(e){}});
+    peer.on('disconnected',()=>{$('#netState').textContent='reconnecting…';setTimeout(()=>{try{if(!peer.destroyed)peer.reconnect();}catch(e){}},1000);});
     peer.on('connection',conn=>{
-      conn.on('open',()=>{FDC.conns.set(conn.peer,{conn,name:'Observer',view:null});renderPlayers();conn.send({t:'state',s:pubState()});});
+      fdcLog('sys','An observer is connecting…');
+      const t=setTimeout(()=>{if(!conn.open)fdcLog('sys','An observer found the room but the direct link did not open. Usually a strict firewall or mobile network on one side.');},15000);
+      conn.on('iceStateChanged',st=>{if(st==='failed')fdcLog('sys','Direct link to an observer failed (firewall / NAT).');});
+      conn.on('open',()=>{clearTimeout(t);FDC.conns.set(conn.peer,{conn,name:'Observer',view:null});renderPlayers();conn.send({t:'state',s:pubState()});});
       conn.on('data',d=>fdcOnData(conn,d));
       conn.on('close',()=>{const p=FDC.conns.get(conn.peer);FDC.conns.delete(conn.peer);if(p)fdcLog('sys',`${p.name} left.`);renderPlayers();drawViews();});
     });
@@ -814,20 +830,29 @@ function startFo(code){
   $('#foCall').textContent=App.name;
   try{FO.ac=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}
   initThree();bindFoUi();
-  const peer=App.peer=new Peer({debug:0});
+  location.hash=code;
+  waitScreen('Joining room '+code,'Step 1 of 2 · contacting the matchmaking server…');
+  const peer=App.peer=new Peer(PEER_OPTS);
+  const fail=(t,x)=>{clearTimeout(FO.joinTimer);waitScreen(t,x,null,true);};
+  FO.joinTimer=setTimeout(()=>{if(!peer.open)fail("Can't reach the matchmaking server",'0.peerjs.com did not answer. A firewall, VPN, school/work network or ad blocker may be blocking it.');},12000);
   peer.on('open',()=>{
+    clearTimeout(FO.joinTimer);
+    waitScreen('Joining room '+code,'Step 2 of 2 · opening a direct link to the FDC…');
     const conn=FO.conn=peer.connect(PEER_PREFIX+code.toLowerCase(),{reliable:true,serialization:'json'});
-    conn.on('open',()=>{conn.send({t:'hello',name:App.name});$('#foNet').textContent='room '+code;waitScreen('Waiting for the FDC','Connected. The exercise starts when the FDC presses Start.');});
+    FO.joinTimer=setTimeout(()=>{if(!conn.open)fail("Can't open a direct link",'The room exists, but the connection to the FDC was blocked. This usually means a strict firewall or mobile hotspot on one side. Try another network or browser, and make sure the FDC tab is still open.');},20000);
+    conn.on('iceStateChanged',st=>{if(st==='failed')fail("Can't open a direct link",'The network blocked the peer-to-peer connection (firewall / NAT). Try another network or browser.');});
+    conn.on('open',()=>{clearTimeout(FO.joinTimer);conn.send({t:'hello',name:App.name});$('#foNet').textContent='room '+code;waitScreen('Connected','Waiting for the FDC to press Start exercise.');});
     conn.on('data',foOnData);
-    conn.on('close',()=>{$('#foNet').textContent='disconnected';waitScreen('Connection lost','The FDC closed the room or the connection dropped. Reload to rejoin.');});
+    conn.on('close',()=>{$('#foNet').textContent='disconnected';fail('Connection lost','The FDC closed the room or the connection dropped.');});
   });
   peer.on('error',err=>{
-    if(err.type==='peer-unavailable')waitScreen('Room not found','Check the room code. The FDC must keep their page open.');
-    else waitScreen('Connection problem',`${err.type}. Reload to try again.`);
+    if(err.type==='peer-unavailable')fail('Room not found',`No open room ${code}. Check the code; the FDC must keep their tab open. If the FDC reloaded, the room has a new code.`);
+    else fail('Connection problem',PEER_ERRORS[err.type]||`Error: ${err.type}.`);
   });
 }
-function waitScreen(title,text,progress){$('#foWait').hidden=false;$('#waitTitle').textContent=title;$('#waitText').textContent=text;
-  const b=$('#waitBar');b.hidden=progress==null;if(progress!=null)b.firstElementChild.style.width=(progress*100).toFixed(0)+'%';}
+function waitScreen(title,text,progress,retry){$('#foWait').hidden=false;$('#waitTitle').textContent=title;$('#waitText').textContent=text;
+  const b=$('#waitBar');b.hidden=progress==null;if(progress!=null)b.firstElementChild.style.width=(progress*100).toFixed(0)+'%';
+  $('#retryBtn').hidden=!retry;}
 function toast(t,ms=2200){const el=$('#toast');el.textContent=t;el.hidden=false;clearTimeout(toast._t);toast._t=setTimeout(()=>el.hidden=true,ms);}
 function foLog(who,text,cls){addLog($('#foLog'),who,text,cls);}
 function foSend(msg){if(FO.conn&&FO.conn.open)FO.conn.send(msg);}

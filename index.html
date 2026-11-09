@@ -276,7 +276,7 @@ textarea{resize:vertical;min-height:54px}
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.150.1/build/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
 'use strict';
 /* ====================================================================
@@ -488,21 +488,43 @@ function addLog(box,who,text,cls){
 /* ====================================================================
    Lobby + networking
    ==================================================================== */
-const PEER_PREFIX='cff-trainer-v1-';
-const PEER_OPTS={debug:/debug/.test(location.search)?2:0,config:{iceServers:[
-  {urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']},
-  {urls:'stun:global.stun.twilio.com:3478'},
-  {urls:['turn:eu-0.turn.peerjs.com:3478','turn:us-0.turn.peerjs.com:3478'],username:'peerjs',credential:'peerjsp'}]}};
-const PEER_ERRORS={
-  'network':'Lost contact with the matchmaking server (0.peerjs.com). Check the internet connection.',
-  'server-error':'The matchmaking server (0.peerjs.com) is not responding. Try again in a minute.',
-  'socket-error':'The matchmaking server connection failed. A firewall or ad blocker may be blocking 0.peerjs.com.',
-  'socket-closed':'The matchmaking server closed the connection. Try again.',
-  'browser-incompatible':'This browser does not support WebRTC. Use a current Chrome, Edge or Firefox.',
-  'webrtc':'The browser could not open a WebRTC connection.'};
+/* Relay: messages go through a public MQTT broker over secure WebSockets, so no direct
+   peer-to-peer link is needed (works on mobile hotspots / carrier NAT). The room code's first
+   letter picks the broker; the code also derives the topic name and an AES-GCM key, so the
+   broker and other users only see random topic names and ciphertext. */
+const BROKERS={E:'wss://broker.emqx.io:8084/mqtt',H:'wss://broker.hivemq.com:8884/mqtt',M:'wss://test.mosquitto.org:8081'};
+const BROKER_ORDER=['E','H','M'];
 const CODE_CHARS='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-const newCode=()=>Array.from({length:6},()=>CODE_CHARS[Math.floor(Math.random()*CODE_CHARS.length)]).join('');
-const App={name:'',role:null,peer:null};
+const randChars=n=>Array.from(crypto.getRandomValues(new Uint8Array(n)),b=>CODE_CHARS[b%32]).join('');
+const randId=()=>randChars(10).toLowerCase();
+const TE=new TextEncoder(),TD=new TextDecoder();
+const toB64=u=>{let s='';for(let i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s);};
+const fromB64=s=>{const b=atob(s),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;};
+async function roomKeys(code){
+  const h=new Uint8Array(await crypto.subtle.digest('SHA-256',TE.encode('cff-trainer-v1:'+code)));
+  const topic='cfft1/'+Array.from(h.slice(0,10),b=>b.toString(16).padStart(2,'0')).join('');
+  const base=await crypto.subtle.importKey('raw',TE.encode(code),'PBKDF2',false,['deriveKey']);
+  const key=await crypto.subtle.deriveKey({name:'PBKDF2',salt:TE.encode('cff-trainer-v1-salt'),iterations:150000,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+  return {topic,key};
+}
+class Relay{
+  constructor(k){this.k=k;this.sq=Promise.resolve();this.rq=Promise.resolve();}
+  async sealStr(obj){const iv=crypto.getRandomValues(new Uint8Array(12));
+    const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},this.k.key,TE.encode(JSON.stringify(obj))));
+    const out=new Uint8Array(12+ct.length);out.set(iv);out.set(ct,12);return toB64(out);}
+  async open(str){try{const b=fromB64(str);if(b.length<13)return null;
+    const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:b.slice(0,12)},this.k.key,b.slice(12));return JSON.parse(TD.decode(pt));}catch(e){return null;}}
+  connect(url,will){return new Promise((res,rej)=>{
+    const c=this.c=mqtt.connect(url,{clientId:'cfft_'+randId(),clean:true,keepalive:20,reconnectPeriod:3000,connectTimeout:9000,will});
+    const to=setTimeout(()=>{c.end(true);rej(new Error('timeout'));},11000);
+    c.once('connect',()=>{clearTimeout(to);res(c);});
+  });}
+  pub(topic,obj,opts){this.sq=this.sq.then(()=>this.sealStr(obj)).then(p=>{this.c.publish(topic,p,opts||{qos:1});}).catch(()=>{});}
+  clear(topic){this.sq=this.sq.then(()=>{this.c.publish(topic,'',{qos:1,retain:true});});}
+  onMsg(fn){this.c.on('message',(topic,payload)=>{const s=payload.toString();
+    this.rq=this.rq.then(async()=>{if(!s){fn(topic,null,true);return;}const o=await this.open(s);if(o)fn(topic,o,false);}).catch(()=>{});});}
+}
+const App={name:'',role:null};
 
 $('#nameIn').value=store.get('cff-name')||'';
 {const h=location.hash.replace('#','').toUpperCase();if(/^[A-Z0-9]{6}$/.test(h))$('#codeIn').value=h;}
@@ -515,7 +537,8 @@ $('#joinBtn').onclick=()=>{
   App.role='fo';App.name=takeName();startFo(code);
 };
 $('#codeIn').addEventListener('keydown',e=>{if(e.key==='Enter')$('#joinBtn').click();});
-if(typeof Peer==='undefined'||typeof THREE==='undefined'||typeof L==='undefined')lobbyErr('A library failed to load. Check your internet connection and reload.');
+if(typeof mqtt==='undefined'||typeof THREE==='undefined'||typeof L==='undefined')lobbyErr('A library failed to load. Check your internet connection and reload.');
+if(!(window.crypto&&crypto.subtle))lobbyErr('This page must be opened over https:// (e.g. GitHub Pages).');
 
 /* ====================================================================
    FDC
@@ -526,32 +549,40 @@ const FDC={
   missions:[],mid:0,layers:{},map:null,code:''
 };
 
-function startFdc(){
+async function startFdc(){
   $('#lobby').hidden=true;$('#fdc').hidden=false;
   initFdcMap();
-  const tryOpen=()=>{
-    FDC.code=newCode();
-    const peer=App.peer=new Peer(PEER_PREFIX+FDC.code.toLowerCase(),PEER_OPTS);
-    const openTimer=setTimeout(()=>{if(!peer.open){$('#netState').textContent='offline';fdcLog('sys','Cannot reach the matchmaking server (0.peerjs.com). A firewall, VPN or ad blocker may be blocking it. Reload to retry.');}},12000);
-    peer.on('open',()=>{clearTimeout(openTimer);$('#roomCode').textContent=FDC.code;$('#netState').textContent='online';location.hash=FDC.code;fdcLog('sys','Room open. Share the code with your observers. Keep this tab open.');});
-    peer.on('error',err=>{
-      if(err.type==='unavailable-id'){clearTimeout(openTimer);peer.destroy();tryOpen();return;}
-      $('#netState').textContent='error';fdcLog('sys',PEER_ERRORS[err.type]||`Connection error: ${err.type}.`);
-    });
-    peer.on('disconnected',()=>{$('#netState').textContent='reconnecting…';setTimeout(()=>{try{if(!peer.destroyed)peer.reconnect();}catch(e){}},1000);});
-    peer.on('connection',conn=>{
-      fdcLog('sys','An observer is connecting…');
-      const t=setTimeout(()=>{if(!conn.open)fdcLog('sys','An observer found the room but the direct link did not open. Usually a strict firewall or mobile network on one side.');},15000);
-      conn.on('iceStateChanged',st=>{if(st==='failed')fdcLog('sys','Direct link to an observer failed (firewall / NAT).');});
-      conn.on('open',()=>{clearTimeout(t);FDC.conns.set(conn.peer,{conn,name:'Observer',view:null});renderPlayers();conn.send({t:'state',s:pubState()});});
-      conn.on('data',d=>fdcOnData(conn,d));
-      conn.on('close',()=>{const p=FDC.conns.get(conn.peer);FDC.conns.delete(conn.peer);if(p)fdcLog('sys',`${p.name} left.`);renderPlayers();drawViews();});
-    });
-  };
-  tryOpen();
+  $('#netState').textContent='connecting…';
+  const rest=randChars(5);
+  for(const b of BROKER_ORDER){
+    const code=b+rest,keys=await roomKeys(code),R=new Relay(keys),T=keys.topic;
+    try{await R.connect(BROKERS[b],{topic:T+'/room',payload:'',qos:1,retain:true});}
+    catch(e){fdcLog('sys',`Relay ${b} did not answer, trying the next one…`);continue;}
+    FDC.R=R;FDC.code=code;
+    R.onMsg(fdcOnRelay);
+    R.c.subscribe(T+'/up/+',{qos:1});
+    R.pub(T+'/room',{t:'room',v:1},{qos:1,retain:true});
+    R.c.on('connect',()=>{$('#netState').textContent='online';R.pub(T+'/room',{t:'room',v:1},{qos:1,retain:true});});
+    R.c.on('reconnect',()=>$('#netState').textContent='reconnecting…');
+    R.c.on('offline',()=>$('#netState').textContent='offline');
+    addEventListener('beforeunload',()=>{try{R.c.publish(T+'/room','',{qos:0,retain:true});}catch(e){}});
+    $('#roomCode').textContent=code;$('#netState').textContent='online';location.hash=code;
+    fdcLog('sys','Room open. Share the code with your observers. Keep this tab open.');
+    return;
+  }
+  $('#netState').textContent='offline';
+  fdcLog('sys','Could not reach any relay server. Check the internet connection, then reload.');
 }
-function fdcSend(peerId,msg){const p=FDC.conns.get(peerId);if(p&&p.conn.open)p.conn.send(msg);}
-function fdcBroadcast(msg,except){for(const [id,p] of FDC.conns)if(id!==except&&p.conn.open)p.conn.send(msg);}
+function fdcOnRelay(topic,d,empty){
+  const T=FDC.R.k.topic;if(empty||!d||!topic.startsWith(T+'/up/'))return;
+  const id=topic.slice(T.length+4);
+  if(d.t==='bye'){const p=FDC.conns.get(id);FDC.conns.delete(id);if(p)fdcLog('sys',`${p.name} left.`);renderPlayers();drawViews();return;}
+  if(!FDC.conns.has(id)){FDC.conns.set(id,{conn:{peer:id,open:true},name:'Observer',view:null});renderPlayers();fdcSend(id,{t:'state',s:pubState()});}
+  else if(d.t==='hello')fdcSend(id,{t:'state',s:pubState()});
+  fdcOnData(FDC.conns.get(id).conn,d);
+}
+function fdcSend(id,msg){if(FDC.R)FDC.R.pub(FDC.R.k.topic+'/down/'+id,msg,{qos:1});}
+function fdcBroadcast(msg,except){if(FDC.R)FDC.R.pub(FDC.R.k.topic+'/down/all',except?{...msg,_x:except}:msg,{qos:1});}
 function pubState(){const s=FDC.st;return {phase:s.phase,exId:s.exId,zone:s.zone,box:s.box,op:s.op,tower:s.tower,veg:s.veg,tools:s.tools,briefing:s.briefing,enemy:s.enemy};}
 function pushState(){fdcBroadcast({t:'state',s:pubState()});}
 function fdcLog(who,text){addLog($('#fdcLog'),who==='sys'?'·':who,text,who==='sys'?'sys':(who===App.name?'fdc':''));}
@@ -825,37 +856,45 @@ const FOV={eye:50,bino:7,plrf:6};
 const FO={conn:null,st:null,key:'',T:null,ready:false,tool:'eye',az:0,el:0,compassOn:true,lases:[],mission:null,missionOt:null,
   scene:null,camera:null,renderer:null,enemyObj:null,fx:[],trees:null,ac:null,buildToken:0,keys:new Set(),lastView:''};
 
-function startFo(code){
+async function startFo(code){
   $('#lobby').hidden=true;$('#fo').hidden=false;
   $('#foCall').textContent=App.name;
   try{FO.ac=new (window.AudioContext||window.webkitAudioContext)();}catch(e){}
   initThree();bindFoUi();
   location.hash=code;
-  waitScreen('Joining room '+code,'Step 1 of 2 · contacting the matchmaking server…');
-  const peer=App.peer=new Peer(PEER_OPTS);
   const fail=(t,x)=>{clearTimeout(FO.joinTimer);waitScreen(t,x,null,true);};
-  FO.joinTimer=setTimeout(()=>{if(!peer.open)fail("Can't reach the matchmaking server",'0.peerjs.com did not answer. A firewall, VPN, school/work network or ad blocker may be blocking it.');},12000);
-  peer.on('open',()=>{
-    clearTimeout(FO.joinTimer);
-    waitScreen('Joining room '+code,'Step 2 of 2 · opening a direct link to the FDC…');
-    const conn=FO.conn=peer.connect(PEER_PREFIX+code.toLowerCase(),{reliable:true,serialization:'json'});
-    FO.joinTimer=setTimeout(()=>{if(!conn.open)fail("Can't open a direct link",'The room exists, but the connection to the FDC was blocked. This usually means a strict firewall or mobile hotspot on one side. Try another network or browser, and make sure the FDC tab is still open.');},20000);
-    conn.on('iceStateChanged',st=>{if(st==='failed')fail("Can't open a direct link",'The network blocked the peer-to-peer connection (firewall / NAT). Try another network or browser.');});
-    conn.on('open',()=>{clearTimeout(FO.joinTimer);conn.send({t:'hello',name:App.name});$('#foNet').textContent='room '+code;waitScreen('Connected','Waiting for the FDC to press Start exercise.');});
-    conn.on('data',foOnData);
-    conn.on('close',()=>{$('#foNet').textContent='disconnected';fail('Connection lost','The FDC closed the room or the connection dropped.');});
+  const url=BROKERS[code[0]];
+  if(!url){fail('Room not found',`${code} is not a valid room code. Codes start with E, H or M; ask your FDC for the current one.`);return;}
+  waitScreen('Joining room '+code,'Step 1 of 2 · connecting to the relay…');
+  const keys=await roomKeys(code),R=FO.R=new Relay(keys),T=keys.topic;FO.id=randId();
+  const bye=await R.sealStr({t:'bye'});
+  try{await R.connect(url,{topic:T+'/up/'+FO.id,payload:bye,qos:1,retain:false});}
+  catch(e){fail("Can't reach the relay",`The relay server did not answer. A firewall, VPN or ad blocker may be blocking secure WebSockets on port ${new URL(url).port}. Try another network.`);return;}
+  waitScreen('Joining room '+code,'Step 2 of 2 · looking for the FDC…');
+  FO.joined=false;FO.roomSeen=false;
+  R.onMsg((topic,d,empty)=>{
+    if(topic===T+'/room'){
+      if(empty){if(FO.roomSeen){$('#foNet').textContent='FDC offline';fail('FDC left','The FDC closed the room or lost connection. If they reopen it, ask for the new room code.');}return;}
+      FO.roomSeen=true;R.pub(T+'/up/'+FO.id,{t:'hello',name:App.name});return;
+    }
+    if(!d||(d._x&&d._x===FO.id))return;
+    if(!FO.joined&&d.t==='state'){FO.joined=true;clearTimeout(FO.joinTimer);$('#foNet').textContent='room '+code;}
+    foOnData(d);
   });
-  peer.on('error',err=>{
-    if(err.type==='peer-unavailable')fail('Room not found',`No open room ${code}. Check the code; the FDC must keep their tab open. If the FDC reloaded, the room has a new code.`);
-    else fail('Connection problem',PEER_ERRORS[err.type]||`Error: ${err.type}.`);
-  });
+  R.c.subscribe([T+'/room',T+'/down/all',T+'/down/'+FO.id],{qos:1});
+  FO.joinTimer=setTimeout(()=>{if(!FO.joined)fail(FO.roomSeen?'FDC not responding':'Room not found',FO.roomSeen
+    ?'The room exists but the FDC did not answer. Make sure the FDC tab is still open.'
+    :`No open room ${code}. Check the code. The FDC must keep their tab open; if they reloaded, the room has a new code.`);},12000);
+  R.c.on('reconnect',()=>$('#foNet').textContent='reconnecting…');
+  R.c.on('connect',()=>{if(FO.joined)$('#foNet').textContent='room '+code;});
+  addEventListener('beforeunload',()=>{try{R.c.publish(T+'/up/'+FO.id,bye,{qos:0});}catch(e){}});
 }
 function waitScreen(title,text,progress,retry){$('#foWait').hidden=false;$('#waitTitle').textContent=title;$('#waitText').textContent=text;
   const b=$('#waitBar');b.hidden=progress==null;if(progress!=null)b.firstElementChild.style.width=(progress*100).toFixed(0)+'%';
   $('#retryBtn').hidden=!retry;}
 function toast(t,ms=2200){const el=$('#toast');el.textContent=t;el.hidden=false;clearTimeout(toast._t);toast._t=setTimeout(()=>el.hidden=true,ms);}
 function foLog(who,text,cls){addLog($('#foLog'),who,text,cls);}
-function foSend(msg){if(FO.conn&&FO.conn.open)FO.conn.send(msg);}
+function foSend(msg){if(FO.R&&FO.id)FO.R.pub(FO.R.k.topic+'/up/'+FO.id,msg,{qos:msg.t==='view'?0:1});}
 
 function foOnData(d){
   if(!d||typeof d!=='object')return;
